@@ -1,1 +1,43 @@
+name: HostShip Auto Renew
+on:
+  schedule:
+    - cron: '15 3 * * *'   # 每天 UTC 03:15（北京时间 11:15）运行一次，可按需调整
+  workflow_dispatch:
+jobs:
+  renew-job:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run Renew Script
+        env:
+          PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
+          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+        run: python hostship_renew.py
+
+      - name: Keep Repo Active
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "Last run: $(date '+%Y-%m-%d %H:%M:%S')" > keep_alive.txt
+          git add keep_alive.txt
+          git diff --staged --quiet || git commit -m "chore: keep alive $(date '+%Y-%m-%d')"
+          git push
