@@ -31,11 +31,18 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
+
       - name: Run Renew Script
         env:
           PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
-        run: python hostship_renew.py
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          run: python hostship_renew.py
 
       - name: Upload debug screenshots (always)
         if: always()
