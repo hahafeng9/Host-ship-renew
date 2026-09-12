@@ -1,8 +1,12 @@
 name: HostShip Auto Renew
 on:
   schedule:
-    - cron: '15 3 * * *'   # 每天 UTC 03:15（北京时间 11:15）运行一次，可按需调整
+    - cron: '15 3 * * *'   # 每天 UTC 03:15(北京时间 11:15)
   workflow_dispatch:
+
+permissions:
+  contents: write          # 修复 git push 403
+
 jobs:
   renew-job:
     runs-on: ubuntu-latest
@@ -20,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}
+          key: playwright-${{ runner.os }}-v1
 
       - name: Install dependencies
         run: |
@@ -32,6 +36,14 @@ jobs:
           PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
         run: python hostship_renew.py
+
+      - name: Upload debug screenshots (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: "*.png"
+          if-no-files-found: ignore
 
       - name: Keep Repo Active
         run: |
