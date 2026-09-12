@@ -1,13 +1,13 @@
 name: HostShip Auto Renew
 on:
   schedule:
-    - cron: '15 3 * * *'   # 每天 UTC 03:15(北京时间 11:15)
+    - cron: '0 3 */7 * *'   # 每 7 天 UTC 03:00(北京 11:00)
   workflow_dispatch:
-
 permissions:
   contents: write          # 修复 git push 403
 
 jobs:
+
   renew-job:
     runs-on: ubuntu-latest
     timeout-minutes: 15
