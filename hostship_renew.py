@@ -316,51 +316,50 @@ def login(page, username, password):
     log("打开登录页...")
     page.goto(LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
-    # 登录页可能先弹人机验证
-    solve_human_check(page)
     try:
         page.get_by_placeholder("Username or Email").first.wait_for(state="visible", timeout=60000)
         page.get_by_placeholder("Password").first.wait_for(state="visible", timeout=60000)
     except Exception:
-        # 再试一轮验证(验证可能后才出现)
-        if not solve_human_check(page):
-            save_debug(page, "login_form_not_found")
-            raise RuntimeError("未找到登录输入框(人机验证未通过)")
-        try:
-            page.get_by_placeholder("Username or Email").first.wait_for(state="visible", timeout=20000)
-            page.get_by_placeholder("Password").first.wait_for(state="visible", timeout=20000)
-        except Exception:
-            save_debug(page, "login_form_not_found")
-            log_page_state(page)
-            raise RuntimeError("未找到登录输入框")
+        save_debug(page, "login_form_not_found")
+        log_page_state(page)
+        raise RuntimeError("未找到登录输入框")
+
     page.get_by_placeholder("Username or Email").first.fill(username)
     page.get_by_placeholder("Password").first.fill(password)
-    sign_in = page.locator('button:has-text("Sign In")')
-    # Sign In 按钮可能在验证通过后才出现/可用
+
+    # 登录页的 Turnstile 在填完账号密码后才真正拦截提交
+    if not solve_human_check(page):
+        save_debug(page, "sign_in_not_found")
+        raise RuntimeError("登录页人机验证未通过")
+
+    submit = page.locator('button[type="submit"]').first
     appeared = False
     for _ in range(30):
-        if sign_in.count() > 0 and sign_in.first.is_visible():
-            appeared = True
-            break
-        if turnstile_frames(page).count() > 0:
+        try:
+            if submit.count() > 0 and submit.is_visible() and not submit.is_disabled():
+                appeared = True
+                break
+        except Exception:
+            pass
+        if _has_turnstile(page):
             solve_human_check(page)
         page.wait_for_timeout(1000)
     if not appeared:
         save_debug(page, "sign_in_not_found")
         log_page_state(page)
-        raise RuntimeError("未找到 Sign In 按钮")
-    page.wait_for_timeout(3000)  # 冷却几秒再点认证/登录
-    if not solve_human_check(page):
-        raise RuntimeError("登录前人机验证未通过")
-    sign_in.first.click()
+        raise RuntimeError("未找到可用的提交按钮")
+
+    page.wait_for_timeout(3000)  # 冷却几秒再点登录
+    submit.click()
     for _ in range(30):
         page.wait_for_timeout(1000)
-        if turnstile_frames(page).count() > 0 and turnstile_token(page) == "":
+        if _has_turnstile(page) and turnstile_token(page) == "":
             solve_human_check(page)  # 提交后如再弹验证, 继续过
         if any(page.locator(m).count() > 0 for m in LOGGED_IN_MARKERS):
             log(f"登录成功: {page.url}")
             return
     save_debug(page, "login_failed")
+    log_page_state(page)
     raise RuntimeError("登录失败")
 
 
@@ -391,6 +390,18 @@ def turnstile_token(page):
         return ""
 
 
+def _has_turnstile(page):
+    try:
+        if page.locator('input[name="cf-turnstile-response"]').count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        return turnstile_frames(page).count() > 0
+    except Exception:
+        return False
+
+
 def _click_turnstile_checkbox(page):
     try:
         tf = page.frame_locator('iframe[src*="challenges.cloudflare.com/turnstile"]').first
@@ -398,37 +409,95 @@ def _click_turnstile_checkbox(page):
         return True
     except Exception:
         pass
-    # 兜底: 直接点 iframe 几何中心
+    # 兜底1: 点击 iframe 几何中心
     try:
         box = turnstile_frames(page).first.bounding_box()
         if box:
             page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
             return True
-    except Exception as e:
-        warn(f"点击验证框失败: {e}")
+    except Exception:
+        pass
+    # 兜底2: 页面上只有 hidden input 时, 根据截图位置点验证码容器左侧复选框区域
+    try:
+        box = page.locator('input[name="cf-turnstile-response"]').first.bounding_box()
+        if box:
+            x = max(5, box["x"] + 28)
+            y = max(5, box["y"] - 18)
+            page.mouse.move(x, y)
+            page.wait_for_timeout(800)
+            page.mouse.click(x, y)
+            page.wait_for_timeout(800)
+            return True
+    except Exception:
+        pass
+    # 兜底3: 点击验证区域容器左中部
+    for sel in ['div.mb-5', 'div[class*="min-h-[65px]"]', 'div.flex.justify-center.min-h-[65px]']:
+        try:
+            box = page.locator(sel).first.bounding_box()
+            if box:
+                x = box["x"] + min(32, box["width"] * 0.18)
+                y = box["y"] + box["height"] / 2
+                page.mouse.move(x, y)
+                page.wait_for_timeout(800)
+                page.mouse.click(x, y)
+                page.wait_for_timeout(800)
+                return True
+        except Exception:
+            pass
+    warn("点击验证框失败: 未找到可点击区域")
     return False
 
 
-def solve_human_check(page, max_rounds=6):
-    """检测并处理 Turnstile 人机验证; 无验证组件时直接返回 True."""
+def solve_human_check(page, max_rounds=3):
+    """等待 Turnstile 出 token; 必要时冷却后点复选框; 仍失败则刷新重试."""
     try:
-        if turnstile_frames(page).count() == 0:
+        if not _has_turnstile(page):
             return True
     except Exception:
         return True
-    log("检测到人机验证 (Turnstile), 开始处理...")
-    page.wait_for_timeout(4000)  # 先冷却几秒再点认证
+    log("检测到人机验证 (Turnstile), 等待通过...")
     for i in range(max_rounds):
-        if turnstile_token(page) == "":
-            _click_turnstile_checkbox(page)
-        for _ in range(8):
-            page.wait_for_timeout(1000)
-            if turnstile_token(page) != "":
+        # 1) 先等自动通过(真实 Chrome 下 managed 模式通常自动完成)
+        for _ in range(45):
+            token = turnstile_token(page)
+            if token != "":
                 log("人机验证通过")
                 return True
-        warn(f"第 {i + 1} 轮验证未通过, 冷却 4 秒后重试")
+            try:
+                submit = page.locator('button[type="submit"]').first
+                txt = (submit.inner_text() or '').strip()
+                if submit.count() > 0 and not submit.is_disabled() and txt.lower() != 'complete the security check':
+                    log("提交按钮已解锁, 视为验证通过")
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+        # 2) 冷却几秒后点击复选框
         page.wait_for_timeout(4000)
+        _click_turnstile_checkbox(page)
+        for _ in range(15):
+            token = turnstile_token(page)
+            if token != "":
+                log("点击复选框后人机验证通过")
+                return True
+            try:
+                submit = page.locator('button[type="submit"]').first
+                txt = (submit.inner_text() or '').strip()
+                if submit.count() > 0 and not submit.is_disabled() and txt.lower() != 'complete the security check':
+                    log("点击复选框后提交按钮已解锁")
+                    return True
+            except Exception:
+                pass
+            page.wait_for_timeout(1000)
+        # 3) 仍失败: 刷新页面重试
+        warn(f"第 {i + 1} 轮验证未通过, 刷新重试")
+        try:
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+        except Exception as e:
+            warn(f"刷新失败: {e}")
     save_debug(page, "captcha_failed")
+    log_page_state(page)
     return False
 
 
