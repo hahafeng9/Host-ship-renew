@@ -1,10 +1,34 @@
+# -*- coding: utf-8 -*-
+"""
+HostShip 自动续期 (带节点代理版)
+
+流程:
+  1. 若配置了 NODE_LINK secret (vless/vmess/trojan/ss 链接),
+     自动解析并生成 xray 配置, 在本机拉起 socks5://127.0.0.1:10808
+  2. Playwright 浏览器通过该节点代理访问 panel.host-ship.com
+  3. 登录 -> 打开服务器页 -> 点击 Renew 续期
+  4. 节点不可用时自动回退直连, 并通过 TG 通知
+"""
+
 import os
 import re
+import json
+import base64
+import shutil
+import socket
+import subprocess
+import zipfile
+import urllib.parse
+
 import requests
 from playwright.sync_api import sync_playwright
 
 PANEL_URL = "https://panel.host-ship.com/"
 LOGIN_URL = PANEL_URL
+
+SOCKS_PORT = 10808
+XRAY_DIR = os.environ.get("XRAY_DIR", "xray-bin")
+XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
 
 LOGGED_IN_MARKERS = [
     'button:has-text("Sign Out")', 'text=Sign Out', 'text=Logout',
@@ -15,10 +39,12 @@ RENEW_SUCCESS_MARKERS = [
 ]
 
 
-def log(msg): print(f"[INFO] {msg}")
-def warn(msg): print(f"[WARN] {msg}")
-def err(msg): print(f"[ERROR] {msg}")
+def log(msg): print(f"[INFO] {msg}", flush=True)
+def warn(msg): print(f"[WARN] {msg}", flush=True)
+def err(msg): print(f"[ERROR] {msg}", flush=True)
 
+
+# ---------------- Telegram ----------------
 
 def tg_send_text(text):
     token = os.environ.get("TG_BOT_TOKEN", "").strip()
@@ -70,6 +96,177 @@ def save_debug(page, tag, send=True):
         return None
 
 
+# ---------------- 节点解析 (生成浏览器可用的 socks5) ----------------
+
+def _b64pad(s):
+    return s + "=" * (-len(s) % 4)
+
+
+def parse_node_link(link):
+    """把 vless/vmess/trojan/ss 分享链接解析成 xray outbound dict."""
+    link = link.strip()
+    scheme = link.split("://", 1)[0].lower()
+
+    if scheme == "vmess":
+        data = json.loads(base64.b64decode(_b64pad(link[8:])).decode("utf-8", "ignore"))
+        net = data.get("net", "tcp")
+        stream = {"network": net, "security": "tls" if str(data.get("tls")) in ("tls", "True", "true") else "none"}
+        if net == "ws":
+            stream["wsSettings"] = {"path": data.get("path", "/")}
+            if data.get("host"):
+                stream["wsSettings"]["headers"] = {"Host": data.get("host")}
+        if stream["security"] == "tls":
+            stream["tlsSettings"] = {"serverName": data.get("sni") or data.get("host") or data.get("add", "")}
+        return {
+            "protocol": "vmess",
+            "settings": {"vnext": [{
+                "address": data["add"],
+                "port": int(data["port"]),
+                "users": [{"id": data["id"], "alterId": int(data.get("aid") or 0), "security": "auto"}],
+            }]},
+            "streamSettings": stream,
+        }
+
+    if scheme in ("vless", "trojan"):
+        u = urllib.parse.urlparse(link)
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        net = q.get("type", "tcp")
+        security = q.get("security", "none" if scheme == "trojan" else "none")
+        if security in ("tls", "reality"):
+            ts = {"serverName": q.get("sni", u.hostname), "allowInsecure": q.get("allowInsecure") == "1"}
+            if q.get("fp"):
+                ts["fingerprint"] = q["fp"]
+            if security == "reality":
+                ts["publicKey"] = q.get("pbk", "")
+                ts["shortId"] = q.get("sid", "")
+        stream = {"network": net, "security": security if security != "reality" else "reality"}
+        if net == "ws":
+            stream["wsSettings"] = {"path": q.get("path", "/")}
+            if q.get("host"):
+                stream["wsSettings"]["headers"] = {"Host": q["host"]}
+        if net == "grpc":
+            stream["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
+        if security in ("tls", "reality"):
+            stream["tlsSettings" if security == "tls" else "realitySettings"] = ts
+
+        if scheme == "vless":
+            return {
+                "protocol": "vless",
+                "settings": {"vnext": [{
+                    "address": u.hostname,
+                    "port": u.port or 443,
+                    "users": [{"id": u.username, "encryption": "none", "flow": q.get("flow", "")}],
+                }]},
+                "streamSettings": stream,
+            }
+        # trojan
+        return {
+            "protocol": "trojan",
+            "settings": {"servers": [{
+                "address": u.hostname,
+                "port": u.port or 443,
+                "password": urllib.parse.unquote(u.username or ""),
+            }]},
+            "streamSettings": stream,
+        }
+
+    if scheme == "ss":
+        body = link[5:].split("#", 1)[0]
+        userinfo, hostport = None, None
+        if "@" in body:
+            userinfo, hostport = body.rsplit("@", 1)
+            try:
+                userinfo = base64.b64decode(_b64pad(userinfo)).decode("utf-8", "ignore")
+            except Exception:
+                userinfo = urllib.parse.unquote(userinfo)
+        else:
+            body = base64.b64decode(_b64pad(body)).decode("utf-8", "ignore")
+            userinfo, hostport = body.rsplit("@", 1)
+        method, password = userinfo.split(":", 1)
+        host, port = hostport.rsplit(":", 1)
+        return {
+            "protocol": "shadowsocks",
+            "settings": {"servers": [{
+                "address": host, "port": int(port),
+                "method": method, "password": password,
+            }]},
+        }
+
+    raise ValueError(f"不支持的节点协议: {scheme}")
+
+
+def build_xray_config(outbound):
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "port": SOCKS_PORT,
+            "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        }],
+        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
+        "routing": {"rules": [{
+            "type": "field",
+            "ip": ["geoip:private"],
+            "outboundTag": "direct",
+        }]},
+    }
+
+
+def download_xray():
+    """下载(或复用已缓存的) xray 二进制, 返回可执行路径."""
+    exe = os.path.join(XRAY_DIR, "xray")
+    if os.path.exists(exe):
+        log("使用已缓存的 xray")
+        return exe
+    log("下载 xray ...")
+    os.makedirs(XRAY_DIR, exist_ok=True)
+    zpath = os.path.join(XRAY_DIR, "xray.zip")
+    with requests.get(XRAY_URL, timeout=120, stream=True) as r:
+        r.raise_for_status()
+        with open(zpath, "wb") as f:
+            for chunk in r.iter_content(1 << 16):
+                f.write(chunk)
+    with zipfile.ZipFile(zpath) as z:
+        for name in z.namelist():
+            if name.strip("/") in ("xray", "geoip.dat", "geosite.dat"):
+                z.extract(name, XRAY_DIR)
+    os.remove(zpath)
+    os.chmod(exe, 0o755)
+    return exe
+
+
+def start_proxy(link):
+    """启动 xray socks5 代理, 返回 (process, proxy_url)."""
+    outbound = parse_node_link(link)
+    cfg_path = os.path.join(XRAY_DIR, "config.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(build_xray_config(outbound), f, ensure_ascii=False)
+
+    exe = download_xray()
+    proc = subprocess.Popen(
+        [exe, "run", "-c", cfg_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    proxy_url = f"socks5://127.0.0.1:{SOCKS_PORT}"
+
+    # 等待 socks5 端口就绪
+    for _ in range(30):
+        if proc.poll() is not None:
+            out = proc.stdout.read().decode("utf-8", "ignore")[:500] if proc.stdout else ""
+            raise RuntimeError(f"xray 启动失败: {out}")
+        try:
+            with socket.create_connection(("127.0.0.1", SOCKS_PORT), timeout=1):
+                return proc, proxy_url
+        except OSError:
+            import time
+            time.sleep(0.5)
+    proc.terminate()
+    raise RuntimeError("socks5 端口等待超时")
+
+
+# ---------------- Playwright 主流程 ----------------
+
 def login(page, username, password):
     log("打开登录页...")
     page.goto(LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
@@ -119,7 +316,7 @@ def renew_server(page, server_id):
     for text in ["Renew", "Renew Server", "续期", "Renouveler"]:
         btn = page.locator(f'button:has-text("{text}")')
         if btn.count() > 0 and btn.first.is_visible():
-            # 新增:按钮禁用 → 跳过,不报错
+            # 按钮禁用 → 跳过, 不报错
             if btn.first.is_disabled() or btn.first.get_attribute("disabled") is not None:
                 log(f"续期按钮禁用,跳过({left})")
                 tg_send_text(f"✅ 服务器 {server_id}:{left},按钮不可用(可能 Renew Limit Reached),本次跳过")
@@ -146,10 +343,33 @@ def renew_server(page, server_id):
     return "not_found"
 
 
+def check_exit_ip(page):
+    """通过浏览器检查出口 IP(走代理时验证节点是否生效)."""
+    try:
+        page.goto("https://api.ipify.org/", timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(1000)
+        ip = page.inner_text("body").strip()
+        if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            log(f"当前出口 IP: {ip}")
+            return ip
+    except Exception as e:
+        warn(f"出口 IP 检查失败: {e}")
+    return None
+
+
+def launch_browser(playwright, proxy_url):
+    args = ["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
+    if proxy_url:
+        args.append(f"--proxy-server={proxy_url}")
+    return playwright.chromium.launch(headless=True, args=args)
+
+
 def run(playwright):
     username = os.environ.get("PANEL_USERNAME", "").strip()
     password = os.environ.get("PANEL_PASSWORD", "").strip()
     server_id = os.environ.get("SERVER_ID", "").strip()
+    node_link = os.environ.get("NODE_LINK", "").strip()
+
     if not username or not password:
         err("缺少 PANEL_USERNAME / PANEL_PASSWORD")
         return
@@ -157,19 +377,48 @@ def run(playwright):
         err("缺少 SERVER_ID")
         return
 
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"],
-    )
+    # ---- 启动节点代理 (可选) ----
+    proxy_proc = None
+    proxy_url = None
+    mode = "直连"
+    if node_link:
+        try:
+            proxy_proc, proxy_url = start_proxy(node_link)
+            mode = "节点代理"
+            log(f"节点代理已就绪: {proxy_url}")
+        except Exception as e:
+            err(f"节点代理启动失败, 回退直连: {e}")
+            tg_send_text(f"⚠️ HostShip 续期: 节点代理启动失败({e}),已回退直连")
+            proxy_proc = None
+            proxy_url = None
+
+    browser = launch_browser(playwright, proxy_url)
     page = browser.new_page(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     )
     try:
+        exit_ip = check_exit_ip(page)
+        if proxy_url and exit_ip is None:
+            # 节点代理不通, 回退直连重开浏览器
+            warn("代理下无法访问外网, 回退直连")
+            tg_send_text("⚠️ HostShip 续期: 节点代理不通,已回退直连")
+            browser.close()
+            proxy_url = None
+            mode = "直连(代理回退)"
+            browser = launch_browser(playwright, None)
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            check_exit_ip(page)
+
+        log(f"访问模式: {mode}")
         login(page, username, password)
         result = renew_server(page, server_id)
+        ip_note = f"\n出口 IP: {exit_ip}" if exit_ip else ""
         if result == "success":
-            tg_send_text(f"✅ HostShip 续期成功: {server_id}")
+            tg_send_text(f"✅ HostShip 续期成功: {server_id}\n模式: {mode}{ip_note}")
         elif result == "404":
             tg_send_text(f"❌ 服务器页面 404: {server_id}")
         elif result == "no_confirmation":
@@ -182,7 +431,12 @@ def run(playwright):
         save_debug(page, "fatal")
         tg_send_text(f"❌ HostShip 自动续期执行失败:{e}")
     finally:
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
+        if proxy_proc:
+            proxy_proc.terminate()
 
 
 with sync_playwright() as playwright:
