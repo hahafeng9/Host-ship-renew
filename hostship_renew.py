@@ -3,8 +3,8 @@
 HostShip 自动续期 (带节点代理版)
 
 流程:
-  1. 若配置了 NODE_LINK secret (vless/vmess/trojan/ss 链接),
-     自动解析并生成 xray 配置, 在本机拉起 socks5://127.0.0.1:10808
+  1. 若配置了 NODE_LINK secret (vless/vmess/hy2/trojan/ss 链接),
+     自动解析并生成 sing-box 配置, 在本机拉起 socks5://127.0.0.1:10808
   2. Playwright 浏览器通过该节点代理访问 panel.host-ship.com
   3. 登录 -> 打开服务器页 -> 点击 Renew 续期
   4. 节点不可用时自动回退直连, 并通过 TG 通知
@@ -12,12 +12,13 @@ HostShip 自动续期 (带节点代理版)
 
 import os
 import re
+import sys
 import json
 import base64
 import shutil
 import socket
 import subprocess
-import zipfile
+import tarfile
 import urllib.parse
 
 import requests
@@ -27,8 +28,10 @@ PANEL_URL = "https://panel.host-ship.com/"
 LOGIN_URL = PANEL_URL
 
 SOCKS_PORT = 10808
-XRAY_DIR = os.environ.get("XRAY_DIR", "xray-bin")
-XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+PROXY_DIR = os.environ.get("PROXY_DIR", "sing-box-bin")
+SINGBOX_VERSION = "1.14.3"
+SINGBOX_URL = (f"https://github.com/SagerNet/sing-box/releases/download/"
+               f"v{SINGBOX_VERSION}/sing-box-{SINGBOX_VERSION}-linux-amd64.tar.gz")
 
 LOGGED_IN_MARKERS = [
     'button:has-text("Sign Out")', 'text=Sign Out', 'text=Logout',
@@ -148,72 +151,79 @@ def _b64pad(s):
 
 
 def parse_node_link(link):
-    """把 vless/vmess/trojan/ss 分享链接解析成 xray outbound dict."""
+    """把 vless/vmess/hy2/trojan/ss 分享链接解析成 sing-box outbound dict."""
     link = link.strip()
     scheme = link.split("://", 1)[0].lower()
 
     if scheme == "vmess":
         data = json.loads(base64.b64decode(_b64pad(link[8:])).decode("utf-8", "ignore"))
-        net = data.get("net", "tcp")
-        stream = {"network": net, "security": "tls" if str(data.get("tls")) in ("tls", "True", "true") else "none"}
-        if net == "ws":
-            stream["wsSettings"] = {"path": data.get("path", "/")}
-            if data.get("host"):
-                stream["wsSettings"]["headers"] = {"Host": data.get("host")}
-        if stream["security"] == "tls":
-            stream["tlsSettings"] = {"serverName": data.get("sni") or data.get("host") or data.get("add", "")}
-        return {
-            "protocol": "vmess",
-            "settings": {"vnext": [{
-                "address": data["add"],
-                "port": int(data["port"]),
-                "users": [{"id": data["id"], "alterId": int(data.get("aid") or 0), "security": "auto"}],
-            }]},
-            "streamSettings": stream,
+        out = {
+            "type": "vmess", "tag": "proxy",
+            "server": data["add"], "server_port": int(data["port"]),
+            "uuid": data["id"], "alter_id": int(data.get("aid") or 0),
+            "security": data.get("scy") or "auto",
         }
+        net = data.get("net", "tcp")
+        if net == "ws":
+            ws = {"type": "ws", "path": data.get("path", "/")}
+            if data.get("host"):
+                ws["headers"] = {"Host": data["host"]}
+            out["transport"] = ws
+        if str(data.get("tls")) in ("tls", "True", "true"):
+            out["tls"] = {"enabled": True,
+                          "server_name": data.get("sni") or data.get("host") or data.get("add", ""),
+                          "insecure": str(data.get("allowInsecure")) in ("1", "true", "True")}
+        return out
 
-    if scheme in ("vless", "trojan"):
+    if scheme in ("vless", "trojan", "hysteria2", "hy2"):
         u = urllib.parse.urlparse(link)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        host = u.hostname
+        port = u.port or 443
         net = q.get("type", "tcp")
-        security = q.get("security", "none" if scheme == "trojan" else "none")
-        if security in ("tls", "reality"):
-            ts = {"serverName": q.get("sni", u.hostname), "allowInsecure": q.get("allowInsecure") == "1"}
-            if q.get("fp"):
-                ts["fingerprint"] = q["fp"]
+        security = q.get("security", "tls" if scheme in ("trojan", "hysteria2", "hy2") else "none")
+
+        tls = None
+        if security in ("tls", "reality") or scheme in ("trojan", "hysteria2", "hy2"):
+            tls = {"enabled": True,
+                   "server_name": q.get("sni") or q.get("peer") or host,
+                   "insecure": q.get("allowInsecure") == "1" or q.get("insecure") == "1"}
+            fp = q.get("fp") or q.get("fingerprint")
+            if fp:
+                tls["utls"] = {"enabled": True, "fingerprint": fp}
             if security == "reality":
-                ts["publicKey"] = q.get("pbk", "")
-                ts["shortId"] = q.get("sid", "")
-        stream = {"network": net, "security": security if security != "reality" else "reality"}
+                tls["reality"] = {"enabled": True,
+                                  "public_key": q.get("pbk", ""),
+                                  "short_id": q.get("sid", "")}
+                if "utls" not in tls:
+                    tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
+
+        transport = None
         if net == "ws":
-            stream["wsSettings"] = {"path": q.get("path", "/")}
+            transport = {"type": "ws", "path": q.get("path", "/")}
             if q.get("host"):
-                stream["wsSettings"]["headers"] = {"Host": q["host"]}
-        if net == "grpc":
-            stream["grpcSettings"] = {"serviceName": q.get("serviceName", "")}
-        if security in ("tls", "reality"):
-            stream["tlsSettings" if security == "tls" else "realitySettings"] = ts
+                transport["headers"] = {"Host": q["host"]}
+        elif net == "grpc":
+            transport = {"type": "grpc", "service_name": q.get("serviceName", "")}
 
         if scheme == "vless":
-            return {
-                "protocol": "vless",
-                "settings": {"vnext": [{
-                    "address": u.hostname,
-                    "port": u.port or 443,
-                    "users": [{"id": u.username, "encryption": "none", "flow": q.get("flow", "")}],
-                }]},
-                "streamSettings": stream,
-            }
-        # trojan
-        return {
-            "protocol": "trojan",
-            "settings": {"servers": [{
-                "address": u.hostname,
-                "port": u.port or 443,
-                "password": urllib.parse.unquote(u.username or ""),
-            }]},
-            "streamSettings": stream,
-        }
+            out = {"type": "vless", "tag": "proxy", "server": host, "server_port": port,
+                   "uuid": urllib.parse.unquote(u.username or "")}
+            if q.get("flow"):
+                out["flow"] = q["flow"]
+        elif scheme == "trojan":
+            out = {"type": "trojan", "tag": "proxy", "server": host, "server_port": port,
+                   "password": urllib.parse.unquote(u.username or "")}
+        else:  # hysteria2 / hy2
+            out = {"type": "hysteria2", "tag": "proxy", "server": host, "server_port": port,
+                   "password": urllib.parse.unquote(u.username or "")}
+            if q.get("obfs") == "salamander" and q.get("obfs-password"):
+                out["obfs"] = {"type": "salamander", "password": q["obfs-password"]}
+        if transport:
+            out["transport"] = transport
+        if tls:
+            out["tls"] = tls
+        return out
 
     if scheme == "ss":
         body = link[5:].split("#", 1)[0]
@@ -230,65 +240,67 @@ def parse_node_link(link):
         method, password = userinfo.split(":", 1)
         host, port = hostport.rsplit(":", 1)
         return {
-            "protocol": "shadowsocks",
-            "settings": {"servers": [{
-                "address": host, "port": int(port),
-                "method": method, "password": password,
-            }]},
+            "type": "shadowsocks", "tag": "proxy",
+            "server": host, "server_port": int(port),
+            "method": method, "password": password,
         }
 
     raise ValueError(f"不支持的节点协议: {scheme}")
 
 
-def build_xray_config(outbound):
+def build_proxy_config(outbound):
     return {
-        "log": {"loglevel": "warning"},
+        "log": {"level": "warn"},
         "inbounds": [{
-            "listen": "127.0.0.1",
-            "port": SOCKS_PORT,
-            "protocol": "socks",
-            "settings": {"udp": True, "auth": "noauth"},
+            "type": "mixed", "tag": "in",
+            "listen": "127.0.0.1", "listen_port": SOCKS_PORT,
         }],
-        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
-        "routing": {"rules": [{
-            "type": "field",
-            "ip": ["geoip:private"],
-            "outboundTag": "direct",
-        }]},
+        "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
+        "route": {
+            "rules": [{"ip_is_private": True, "outbound": "direct"}],
+            "final": outbound.get("tag", "proxy"),
+        },
     }
 
 
-def download_xray():
-    """下载(或复用已缓存的) xray 二进制, 返回可执行路径."""
-    exe = os.path.join(XRAY_DIR, "xray")
+def download_singbox():
+    """下载(或复用已缓存的) sing-box 二进制, 返回可执行路径."""
+    exe = os.path.join(PROXY_DIR, "sing-box")
     if os.path.exists(exe):
-        log("使用已缓存的 xray")
+        log("使用已缓存的 sing-box")
         return exe
-    log("下载 xray ...")
-    os.makedirs(XRAY_DIR, exist_ok=True)
-    zpath = os.path.join(XRAY_DIR, "xray.zip")
-    with requests.get(XRAY_URL, timeout=120, stream=True) as r:
+    log("下载 sing-box ...")
+    os.makedirs(PROXY_DIR, exist_ok=True)
+    tpath = os.path.join(PROXY_DIR, "sing-box.tar.gz")
+    with requests.get(SINGBOX_URL, timeout=180, stream=True) as r:
         r.raise_for_status()
-        with open(zpath, "wb") as f:
+        with open(tpath, "wb") as f:
             for chunk in r.iter_content(1 << 16):
                 f.write(chunk)
-    with zipfile.ZipFile(zpath) as z:
-        for name in z.namelist():
-            if name.strip("/") in ("xray", "geoip.dat", "geosite.dat"):
-                z.extract(name, XRAY_DIR)
-    os.remove(zpath)
+    found = False
+    with tarfile.open(tpath) as t:
+        for m in t.getmembers():
+            if m.name.endswith("/sing-box") and m.isfile():
+                with open(exe, "wb") as f:
+                    shutil.copyfileobj(t.extractfile(m), f)
+                found = True
+                break
+    os.remove(tpath)
+    if not found:
+        raise RuntimeError("sing-box 压缩包里没找到二进制")
     os.chmod(exe, 0o755)
     return exe
 
 
 def start_proxy(link):
-    """启动 xray socks5 代理, 返回 (process, proxy_url)."""
+    """启动 sing-box socks5 代理, 返回 (process, proxy_url)."""
     outbound = parse_node_link(link)
-    cfg_path = os.path.join(XRAY_DIR, "config.json")
+    os.makedirs(PROXY_DIR, exist_ok=True)
+    cfg_path = os.path.join(PROXY_DIR, "config.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(build_xray_config(outbound), f, ensure_ascii=False)
+        json.dump(build_proxy_config(outbound), f, ensure_ascii=False)
 
-    exe = download_xray()
+    exe = download_singbox()
     proc = subprocess.Popen(
         [exe, "run", "-c", cfg_path],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -296,10 +308,10 @@ def start_proxy(link):
     proxy_url = f"socks5://127.0.0.1:{SOCKS_PORT}"
 
     # 等待 socks5 端口就绪
-    for _ in range(30):
+    for _ in range(40):
         if proc.poll() is not None:
             out = proc.stdout.read().decode("utf-8", "ignore")[:500] if proc.stdout else ""
-            raise RuntimeError(f"xray 启动失败: {out}")
+            raise RuntimeError(f"sing-box 启动失败: {out}")
         try:
             with socket.create_connection(("127.0.0.1", SOCKS_PORT), timeout=1):
                 return proc, proxy_url
@@ -586,10 +598,10 @@ def run(playwright):
 
     if not username or not password:
         err("缺少 PANEL_USERNAME / PANEL_PASSWORD")
-        return
+        return False
     if not server_id:
         err("缺少 SERVER_ID")
-        return
+        return False
 
     # ---- 启动节点代理 (可选) ----
     proxy_proc = None
@@ -634,10 +646,12 @@ def run(playwright):
         elif result == "not_found":
             tg_send_text(f"⚠️ 未找到续期按钮:{server_id},请看截图")
         # skip 已在 renew_server 里发过通知,这里不用再发
+        return True
     except Exception as e:
         err(f"执行失败: {e}")
         save_debug(page, "fatal")
         tg_send_text(f"❌ HostShip 自动续期执行失败:{e}")
+        return False
     finally:
         try:
             browser.close()
@@ -648,4 +662,4 @@ def run(playwright):
 
 
 with sync_playwright() as playwright:
-    run(playwright)
+    sys.exit(0 if run(playwright) else 1)
