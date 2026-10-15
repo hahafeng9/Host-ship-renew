@@ -26,11 +26,11 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-v1
 
-      - name: Cache xray binary
+      - name: Cache sing-box binary
         uses: actions/cache@v4
         with:
-          path: xray-bin
-          key: xray-linux64-v1
+          path: sing-box-bin
+          key: sing-box-linux64-v1
 
       - name: Install dependencies
         run: |
