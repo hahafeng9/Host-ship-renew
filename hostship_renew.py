@@ -38,6 +38,18 @@ RENEW_SUCCESS_MARKERS = [
     "Success", "success", "成功", "续期", "Renewed", "extended", "Extended",
 ]
 
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en', 'zh-CN']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+const origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (p) =>
+    p.name === 'notifications'
+        ? Promise.resolve({state: Notification.permission})
+        : origQuery(p);
+"""
+
 
 def log(msg): print(f"[INFO] {msg}", flush=True)
 def warn(msg): print(f"[WARN] {msg}", flush=True)
@@ -270,21 +282,46 @@ def start_proxy(link):
 def login(page, username, password):
     log("打开登录页...")
     page.goto(LOGIN_URL, timeout=60000, wait_until="domcontentloaded")
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(3000)
+    # 登录页可能先弹人机验证
+    solve_human_check(page)
     try:
-        page.get_by_placeholder("Username or Email").first.wait_for(state="visible", timeout=30000)
-        page.get_by_placeholder("Password").first.wait_for(state="visible", timeout=30000)
+        page.get_by_placeholder("Username or Email").first.wait_for(state="visible", timeout=60000)
+        page.get_by_placeholder("Password").first.wait_for(state="visible", timeout=60000)
     except Exception:
-        save_debug(page, "login_form_not_found")
-        raise RuntimeError("未找到登录输入框")
+        # 再试一轮验证(验证可能后才出现)
+        if not solve_human_check(page):
+            save_debug(page, "login_form_not_found")
+            raise RuntimeError("未找到登录输入框(人机验证未通过)")
+        try:
+            page.get_by_placeholder("Username or Email").first.wait_for(state="visible", timeout=20000)
+            page.get_by_placeholder("Password").first.wait_for(state="visible", timeout=20000)
+        except Exception:
+            save_debug(page, "login_form_not_found")
+            raise RuntimeError("未找到登录输入框")
     page.get_by_placeholder("Username or Email").first.fill(username)
     page.get_by_placeholder("Password").first.fill(password)
     sign_in = page.locator('button:has-text("Sign In")')
-    if sign_in.count() == 0:
-        raise RuntimeError("未找到 Sign In 按钮")
-    sign_in.first.click()
-    for _ in range(20):
+    # Sign In 按钮可能在验证通过后才出现/可用
+    appeared = False
+    for _ in range(30):
+        if sign_in.count() > 0 and sign_in.first.is_visible():
+            appeared = True
+            break
+        if turnstile_frames(page).count() > 0:
+            solve_human_check(page)
         page.wait_for_timeout(1000)
+    if not appeared:
+        save_debug(page, "sign_in_not_found")
+        raise RuntimeError("未找到 Sign In 按钮")
+    page.wait_for_timeout(3000)  # 冷却几秒再点认证/登录
+    if not solve_human_check(page):
+        raise RuntimeError("登录前人机验证未通过")
+    sign_in.first.click()
+    for _ in range(30):
+        page.wait_for_timeout(1000)
+        if turnstile_frames(page).count() > 0 and turnstile_token(page) == "":
+            solve_human_check(page)  # 提交后如再弹验证, 继续过
         if any(page.locator(m).count() > 0 for m in LOGGED_IN_MARKERS):
             log(f"登录成功: {page.url}")
             return
@@ -300,11 +337,72 @@ def get_renewal_days(page):
         return None
 
 
+# ---------------- 人机验证 (Cloudflare Turnstile) ----------------
+
+def turnstile_frames(page):
+    return page.locator('iframe[src*="challenges.cloudflare.com/turnstile"]')
+
+
+def turnstile_token(page):
+    try:
+        return page.evaluate(
+            """() => {
+                const el = document.querySelector(
+                    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                return el ? el.value : '';
+            }"""
+        ) or ""
+    except Exception:
+        return ""
+
+
+def _click_turnstile_checkbox(page):
+    try:
+        tf = page.frame_locator('iframe[src*="challenges.cloudflare.com/turnstile"]').first
+        tf.locator("input[type='checkbox']").click(timeout=4000)
+        return True
+    except Exception:
+        pass
+    # 兜底: 直接点 iframe 几何中心
+    try:
+        box = turnstile_frames(page).first.bounding_box()
+        if box:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            return True
+    except Exception as e:
+        warn(f"点击验证框失败: {e}")
+    return False
+
+
+def solve_human_check(page, max_rounds=6):
+    """检测并处理 Turnstile 人机验证; 无验证组件时直接返回 True."""
+    try:
+        if turnstile_frames(page).count() == 0:
+            return True
+    except Exception:
+        return True
+    log("检测到人机验证 (Turnstile), 开始处理...")
+    page.wait_for_timeout(4000)  # 先冷却几秒再点认证
+    for i in range(max_rounds):
+        if turnstile_token(page) == "":
+            _click_turnstile_checkbox(page)
+        for _ in range(8):
+            page.wait_for_timeout(1000)
+            if turnstile_token(page) != "":
+                log("人机验证通过")
+                return True
+        warn(f"第 {i + 1} 轮验证未通过, 冷却 4 秒后重试")
+        page.wait_for_timeout(4000)
+    save_debug(page, "captcha_failed")
+    return False
+
+
 def renew_server(page, server_id):
     url = f"{PANEL_URL}server/{server_id}"
     log(f"打开详情页: {url}")
     page.goto(url, timeout=60000, wait_until="domcontentloaded")
     page.wait_for_timeout(2500)
+    solve_human_check(page)  # 详情页也可能弹验证
 
     if page.locator('text=The requested resource was not found').count() > 0:
         save_debug(page, "page_404")
@@ -358,10 +456,22 @@ def check_exit_ip(page):
 
 
 def launch_browser(playwright, proxy_url):
-    args = ["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu"]
+    args = ["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu",
+            "--disable-blink-features=AutomationControlled"]
     if proxy_url:
         args.append(f"--proxy-server={proxy_url}")
-    return playwright.chromium.launch(headless=True, args=args)
+    # 默认有头(配合 xvfb); HEADLESS=1 时才无头
+    headless = os.environ.get("HEADLESS", "0").strip() == "1"
+    return playwright.chromium.launch(headless=headless, args=args)
+
+
+def new_page(browser):
+    page = browser.new_page(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    )
+    page.add_init_script(STEALTH_JS)
+    return page
 
 
 def run(playwright):
@@ -393,10 +503,7 @@ def run(playwright):
             proxy_url = None
 
     browser = launch_browser(playwright, proxy_url)
-    page = browser.new_page(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    )
+    page = new_page(browser)
     try:
         exit_ip = check_exit_ip(page)
         if proxy_url and exit_ip is None:
@@ -407,10 +514,7 @@ def run(playwright):
             proxy_url = None
             mode = "直连(代理回退)"
             browser = launch_browser(playwright, None)
-            page = browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
+            page = new_page(browser)
             check_exit_ip(page)
 
         log(f"访问模式: {mode}")
