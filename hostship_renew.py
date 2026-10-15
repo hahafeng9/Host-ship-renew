@@ -460,6 +460,24 @@ def _click_turnstile_checkbox(page):
     return False
 
 
+def _click_security_check_button(page):
+    """点击 'Complete the security check' 按钮以触发 Turnstile 执行(本站为点击触发型)."""
+    try:
+        btn = page.locator('button:has-text("Complete the security check")').first
+        if btn.count() == 0 or not btn.is_visible():
+            return False
+        box = btn.bounding_box()
+        if box:
+            page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            page.wait_for_timeout(600)
+        btn.click(timeout=5000)
+        log("已点击 Complete the security check 按钮, 等待验证执行")
+        return True
+    except Exception as e:
+        warn(f"点击安全检查按钮失败: {e}")
+        return False
+
+
 def solve_human_check(page, max_rounds=3):
     """等待 Turnstile 出 token; 必要时冷却后点复选框; 仍失败则刷新重试."""
     try:
@@ -484,8 +502,24 @@ def solve_human_check(page, max_rounds=3):
             except Exception:
                 pass
             page.wait_for_timeout(1000)
-        # 2) 冷却几秒后点击复选框
+        # 2) 冷却几秒后: 先点 "Complete the security check" 按钮触发验证执行,
+        #    再兜底点复选框
         page.wait_for_timeout(4000)
+        if _click_security_check_button(page):
+            for _ in range(20):
+                token = turnstile_token(page)
+                if token != "":
+                    log("点击安全检查按钮后人机验证通过")
+                    return True
+                try:
+                    submit = page.locator('button[type="submit"]').first
+                    txt = (submit.inner_text() or '').strip()
+                    if submit.count() > 0 and txt.lower() != 'complete the security check':
+                        log("安全检查按钮文案已变, 视为验证通过")
+                        return True
+                except Exception:
+                    pass
+                page.wait_for_timeout(1000)
         _click_turnstile_checkbox(page)
         for _ in range(15):
             token = turnstile_token(page)
@@ -578,14 +612,17 @@ def launch_browser(playwright, proxy_url):
         args.append(f"--proxy-server={proxy_url}")
     # 默认有头(配合 xvfb); HEADLESS=1 时才无头
     headless = os.environ.get("HEADLESS", "0").strip() == "1"
-    return playwright.chromium.launch(headless=headless, args=args)
+    # 优先用系统自带 Google Chrome(指纹更真实, Turnstile 通过率更高), 失败回退 Chromium
+    try:
+        return playwright.chromium.launch(channel="chrome", headless=headless, args=args)
+    except Exception as e:
+        warn(f"系统 Chrome 启动失败, 回退 Chromium: {e}")
+        return playwright.chromium.launch(headless=headless, args=args)
 
 
 def new_page(browser):
-    page = browser.new_page(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    )
+    # 不覆盖 UA: 用浏览器自带 UA, 避免 UA 与真实内核版本不一致露馅
+    page = browser.new_page()
     page.add_init_script(STEALTH_JS)
     return page
 
