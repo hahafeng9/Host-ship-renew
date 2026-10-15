@@ -102,10 +102,43 @@ def save_debug(page, tag, send=True):
         page.screenshot(path=path, full_page=True)
         if send:
             tg_send_photo(path, caption=f"📸 {tag}")
-        return path
     except Exception as e:
         warn(f"截图失败: {e}")
-        return None
+    try:
+        with open(f"debug_{tag}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+    except Exception as e:
+        warn(f"保存HTML失败: {e}")
+    return None
+
+
+def log_page_state(page):
+    """采集页面上的按钮/iframe 信息, 便于定位验证组件."""
+    try:
+        btns = page.eval_on_selector_all(
+            "button, input[type='submit'], a[class*='btn']",
+            "els => els.map(e => (e.innerText || e.value || '').trim()).filter(Boolean)",
+        )
+        warn(f"页面按钮: {btns[:20]}")
+    except Exception as e:
+        warn(f"采集按钮失败: {e}")
+    try:
+        ifr = page.eval_on_selector_all("iframe", "els => els.map(e => e.src)")
+        warn(f"页面iframe: {ifr[:10]}")
+    except Exception as e:
+        warn(f"采集iframe失败: {e}")
+    try:
+        captcha = page.eval_on_selector_all(
+            "[class*='captcha'], [class*='turnstile'], [class*='hcaptcha'], [class*='recaptcha'], [class*='geetest'], [id*='captcha'], [id*='turnstile'], [id*='hcaptcha'], [id*='recaptcha'], [id*='geetest']",
+            "els => els.map(e => (e.tagName + '|' + (e.className||'') + '|' + (e.id||'')).slice(0,120))",
+        )
+        warn(f"疑似验证组件: {captcha[:10]}")
+    except Exception:
+        pass
+    try:
+        warn(f"当前URL: {page.url}")
+    except Exception:
+        pass
 
 
 # ---------------- 节点解析 (生成浏览器可用的 socks5) ----------------
@@ -298,6 +331,7 @@ def login(page, username, password):
             page.get_by_placeholder("Password").first.wait_for(state="visible", timeout=20000)
         except Exception:
             save_debug(page, "login_form_not_found")
+            log_page_state(page)
             raise RuntimeError("未找到登录输入框")
     page.get_by_placeholder("Username or Email").first.fill(username)
     page.get_by_placeholder("Password").first.fill(password)
@@ -313,6 +347,7 @@ def login(page, username, password):
         page.wait_for_timeout(1000)
     if not appeared:
         save_debug(page, "sign_in_not_found")
+        log_page_state(page)
         raise RuntimeError("未找到 Sign In 按钮")
     page.wait_for_timeout(3000)  # 冷却几秒再点认证/登录
     if not solve_human_check(page):
