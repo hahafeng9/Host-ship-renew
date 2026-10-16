@@ -361,6 +361,16 @@ def login(page, username, password):
         log_page_state(page)
         raise RuntimeError("未找到可用的提交按钮")
 
+    # 验证过程可能清掉已填内容, 提交前补填一次
+    try:
+        _u = page.get_by_placeholder("Username or Email").first
+        _p = page.get_by_placeholder("Password").first
+        if (_u.input_value() or "") == "":
+            _u.fill(username)
+        if (_p.input_value() or "") == "":
+            _p.fill(password)
+    except Exception:
+        pass
     page.wait_for_timeout(3000)  # 冷却几秒再点登录
     submit.click()
     for _ in range(30):
@@ -386,7 +396,7 @@ def get_renewal_days(page):
 # ---------------- 人机验证 (Cloudflare Turnstile) ----------------
 
 def turnstile_frames(page):
-    return page.locator('iframe[src*="challenges.cloudflare.com/turnstile"]')
+    return page.locator('iframe[src*="challenges.cloudflare.com"]')
 
 
 def turnstile_token(page):
@@ -415,34 +425,53 @@ def _has_turnstile(page):
 
 
 def _click_turnstile_checkbox(page):
+    # 方式1: 进 iframe 点内部复选框
     try:
-        tf = page.frame_locator('iframe[src*="challenges.cloudflare.com/turnstile"]').first
+        tf = page.frame_locator('iframe[src*="challenges.cloudflare.com"]').first
         tf.locator("input[type='checkbox']").click(timeout=4000)
         return True
     except Exception:
         pass
-    # 兜底1: 点击 iframe 几何中心
+    # 方式2: 经 hidden input 定位 widget 容器盒, 点击其左侧复选框位置
+    # (截图实证: widget 是 "Verify you are human" 横盒, 复选框在盒子左端)
+    try:
+        box = page.evaluate(
+            """() => {
+                const el = document.querySelector(
+                    'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                if (!el) return null;
+                let n = el;
+                for (let i = 0; i < 8 && n; i++) {
+                    n = n.parentElement;
+                    if (!n) break;
+                    const r = n.getBoundingClientRect();
+                    if (r.width >= 200 && r.height >= 40 && r.height <= 140) {
+                        return {x: r.x, y: r.y, width: r.width, height: r.height};
+                    }
+                }
+                return null;
+            }""")
+        if box:
+            x = box["x"] + 26
+            y = box["y"] + box["height"] / 2
+            page.mouse.move(x - 40, y - 12)
+            page.wait_for_timeout(350)
+            page.mouse.move(x, y)
+            page.wait_for_timeout(450)
+            page.mouse.click(x, y)
+            page.wait_for_timeout(600)
+            return True
+    except Exception as e:
+        warn(f"定位验证盒失败: {e}")
+    # 方式3: iframe 几何位置左端
     try:
         box = turnstile_frames(page).first.bounding_box()
         if box:
-            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            page.mouse.click(box["x"] + 26, box["y"] + box["height"] / 2)
             return True
     except Exception:
         pass
-    # 兜底2: 页面上只有 hidden input 时, 根据截图位置点验证码容器左侧复选框区域
-    try:
-        box = page.locator('input[name="cf-turnstile-response"]').first.bounding_box()
-        if box:
-            x = max(5, box["x"] + 28)
-            y = max(5, box["y"] - 18)
-            page.mouse.move(x, y)
-            page.wait_for_timeout(800)
-            page.mouse.click(x, y)
-            page.wait_for_timeout(800)
-            return True
-    except Exception:
-        pass
-    # 兜底3: 点击验证区域容器左中部
+    # 方式4: 已知容器类名兜底(左中部)
     for sel in ['div.mb-5', 'div[class*="min-h-[65px]"]', 'div.flex.justify-center.min-h-[65px]']:
         try:
             box = page.locator(sel).first.bounding_box()
@@ -464,7 +493,7 @@ def _click_security_check_button(page):
     """点击 'Complete the security check' 按钮以触发 Turnstile 执行(本站为点击触发型)."""
     try:
         btn = page.locator('button:has-text("Complete the security check")').first
-        if btn.count() == 0 or not btn.is_visible():
+        if btn.count() == 0 or not btn.is_visible() or btn.is_disabled():
             return False
         box = btn.bounding_box()
         if box:
@@ -535,13 +564,13 @@ def solve_human_check(page, max_rounds=3):
             except Exception:
                 pass
             page.wait_for_timeout(1000)
-        # 3) 仍失败: 刷新页面重试
-        warn(f"第 {i + 1} 轮验证未通过, 刷新重试")
+        # 3) 仍失败: 不刷新页面(会清掉已填的账号密码), 用 JS 重置 widget 后继续下一轮
+        warn(f"第 {i + 1} 轮验证未通过, 重置验证后重试")
         try:
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
-        except Exception as e:
-            warn(f"刷新失败: {e}")
+            page.evaluate("() => { try { window.turnstile && window.turnstile.reset(); } catch (e) {} }")
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
     save_debug(page, "captcha_failed")
     log_page_state(page)
     return False
