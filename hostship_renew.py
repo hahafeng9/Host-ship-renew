@@ -22,7 +22,11 @@ import tarfile
 import urllib.parse
 
 import requests
-from playwright.sync_api import sync_playwright
+try:
+    # patchright: 修补 CDP 泄漏的 Playwright 分支, 对 Turnstile 的 Verifying 阶段通过率更高
+    from patchright.sync_api import sync_playwright
+except ImportError:
+    from playwright.sync_api import sync_playwright
 
 PANEL_URL = "https://panel.host-ship.com/"
 LOGIN_URL = PANEL_URL
@@ -107,11 +111,7 @@ def save_debug(page, tag, send=True):
             tg_send_photo(path, caption=f"📸 {tag}")
     except Exception as e:
         warn(f"截图失败: {e}")
-    try:
-        with open(f"debug_{tag}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-    except Exception as e:
-        warn(f"保存HTML失败: {e}")
+    # 不再保存整页 HTML: 其中含已填账号密码的明文表单值, 随 artifact 上传会泄漏
     return None
 
 
@@ -550,7 +550,7 @@ def solve_human_check(page, max_rounds=3):
                     pass
                 page.wait_for_timeout(1000)
         _click_turnstile_checkbox(page)
-        for _ in range(15):
+        for _ in range(60):
             token = turnstile_token(page)
             if token != "":
                 log("点击复选框后人机验证通过")
