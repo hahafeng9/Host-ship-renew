@@ -36,8 +36,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
-          pip install playwright requests
-          playwright install --with-deps chromium
+          pip install patchright requests
+          patchright install --with-deps chromium
 
       - name: Run Renew Script
         env:
