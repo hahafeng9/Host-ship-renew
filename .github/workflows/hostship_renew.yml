@@ -1,70 +1,68 @@
 name: HostShip Auto Renew
+
 on:
   schedule:
-    - cron: '0 3 */7 * *'   # 每 7 天 UTC 03:00(北京 11:00)
+    - cron: '0 3 */7 * *'
   workflow_dispatch:
+
 permissions:
-  contents: write          # 修复 git push 403
+  contents: write
 
 jobs:
-
   renew-job:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-v1
-
-      - name: Cache sing-box binary
-        uses: actions/cache@v4
-        with:
-          path: sing-box-bin
-          key: sing-box-linux64-v1
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          pip install patchright requests
-          patchright install --with-deps chromium
+          python-version: '3.12'
 
       - name: Run Renew Script
         env:
-          PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
-          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+          PANEL_COOKIE: ${{ secrets.PANEL_COOKIE }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-          HEADLESS: '0'
-        run: xvfb-run -a python hostship_renew.py
+          HOSTSHIP_ROTATED_FILE: ${{ runner.temp }}/hostship_rotated_cookie.txt
+        run: python hostship_renew.py
 
-      - name: Upload debug screenshots (always)
+      - name: Write back rotated cookie
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug
-          path: |
-            *.png
-            *.html
-          if-no-files-found: ignore
+        env:
+          GH_TOKEN: ${{ secrets.HOSTSHIP_SECRET_WRITER }}
+          ROTATED_FILE: ${{ runner.temp }}/hostship_rotated_cookie.txt
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOSTSHIP_SECRET_WRITER not configured, skip write-back."
+            exit 0
+          fi
+          if [ -s "$ROTATED_FILE" ]; then
+            gh secret set PANEL_COOKIE --repo "$GITHUB_REPOSITORY" < "$ROTATED_FILE" \
+              && echo "PANEL_COOKIE rotated and written back." \
+              || echo "::warning::Failed to write back PANEL_COOKIE."
+            rm -f "$ROTATED_FILE"
+          else
+            echo "No cookie rotation this run."
+          fi
 
       - name: Keep Repo Active
+        env:
+          GH_TOKEN: ${{ secrets.HOSTSHIP_SECRET_WRITER }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "No writer token, skip keep-alive commit."
+            exit 0
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "Last run: $(date '+%Y-%m-%d %H:%M:%S')" > keep_alive.txt
-          git add keep_alive.txt
-          git diff --staged --quiet || git commit -m "chore: keep alive $(date '+%Y-%m-%d')"
-          git push
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > keep_alive.txt
+          if git diff --quiet keep_alive.txt; then
+            echo "keep_alive.txt unchanged."
+          else
+            git add keep_alive.txt
+            git commit -m "chore: keep repo active"
+            git push || echo "::warning::keep-alive push failed."
+          fi
